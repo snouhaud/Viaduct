@@ -157,7 +157,9 @@ impl ViaductWindow {
             for folder in &opml.folders {
                 feeds.extend(folder.feeds.iter().cloned());
             }
-            if feeds.is_empty() {
+            // A sync account with an empty OPML still has to reach the
+            // server: its first sync is what fills the subscription list.
+            if feeds.is_empty() && account.is_local_account() {
                 let _ = done_tx.send(RefreshTally::default());
                 return;
             }
@@ -580,11 +582,21 @@ async fn run_refresh_with_tally(
     activity_log: Option<Arc<crate::network::activity::ActivityLog>>,
 ) -> RefreshTally {
     let feeds_attempted = paired.len();
+    // A Reader API account (Inoreader, FreshRSS) gets its articles from
+    // the server, keyed by the server's item IDs, like NNW's ReaderAPI
+    // accounts. Fetching the feeds directly as well stored a parallel set
+    // under locally hashed IDs the status reconcile could never match
+    // (it then marked them all read), so only the sync runs.
+    let paired = if account.is_local_account() {
+        paired
+    } else {
+        Vec::new()
+    };
     // v2.6.10: publish the total to the GTK side BEFORE running so the
     // poll loop can switch from indeterminate-pulse to fraction mode.
     if let Some(p) = progress.as_ref() {
         p.total
-            .store(feeds_attempted, std::sync::atomic::Ordering::Relaxed);
+            .store(paired.len(), std::sync::atomic::Ordering::Relaxed);
     }
     // v2.6.3 + v2.6.16: pre-cycle peak + breakdown so the post-cycle
     // line carries deltas. The breakdown (anon_mb / file_mb /

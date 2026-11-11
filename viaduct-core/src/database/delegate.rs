@@ -247,6 +247,12 @@ impl AccountDelegate for LocalAccountDelegate {
 pub struct InoreaderAccountDelegate {
     caller: ReaderAPICaller,
     rate_limiter: SyncRateLimiter,
+    /// Reader API stream ID (`feed/132` on FreshRSS, `feed/<url>` on
+    /// Inoreader) → feed URL. Local feeds are keyed by URL (the OPML
+    /// carries no server ID), so downloaded articles are filed under the
+    /// URL, not the stream ID; otherwise they never show under their feed
+    /// and the startup cleanup deletes them as orphans.
+    stream_urls: tokio::sync::RwLock<std::collections::HashMap<String, String>>,
 }
 
 impl Default for InoreaderAccountDelegate {
@@ -267,6 +273,7 @@ impl InoreaderAccountDelegate {
         Self {
             caller,
             rate_limiter: SyncRateLimiter::new(),
+            stream_urls: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -326,10 +333,22 @@ impl InoreaderAccountDelegate {
         // rather than reconciling against a half-present server picture.
         let sub_cget = load_conditional_get(account, SYNC_CGET_SUBSCRIPTIONS).await?;
         let tags_cget = load_conditional_get(account, SYNC_CGET_TAGS).await?;
+        // An empty stream→URL map (first cycle of this run) needs the full
+        // list, so skip the conditional GET then.
+        let sub_cget = if self.stream_urls.read().await.is_empty() {
+            ConditionalGetHeaders::default()
+        } else {
+            sub_cget
+        };
         let subscriptions = self
             .caller
             .retrieve_subscriptions(auth_token, &sub_cget)
             .await?;
+        if let Some(subs) = subscriptions.items.as_ref() {
+            let mut map = self.stream_urls.write().await;
+            map.clear();
+            map.extend(subs.iter().map(|s| (s.feed_id.clone(), s.url.clone())));
+        }
         let tags = self.caller.retrieve_tags(auth_token, &tags_cget).await?;
 
         let ReaderAPIListResult {
@@ -552,16 +571,29 @@ impl InoreaderAccountDelegate {
 
         // 4. Refresh Missing Articles
         let missing_ids = account.fetch_missing_article_ids().await?;
+        let stream_urls = self.stream_urls.read().await.clone();
         if !missing_ids.is_empty() {
             for chunk in missing_ids.chunks(100) {
                 let entries = self.caller.retrieve_entries(auth_token, chunk).await?;
                 let mut articles = Vec::new();
                 for entry in entries {
                     if let Some(ref stream_id) = entry.origin.stream_id {
-                        let stream_id = stream_id.clone();
-                        let unique_id = entry.unique_id();
-                        let article_id =
-                            crate::database::articles::article_id_for(&stream_id, &unique_id);
+                        // Filed under the local feed ID (its URL). Inoreader
+                        // stream IDs embed the URL; fall back to that.
+                        let stream_id = stream_urls
+                            .get(stream_id)
+                            .cloned()
+                            .or_else(|| {
+                                stream_id
+                                    .strip_prefix("feed/")
+                                    .filter(|u| u.contains("://"))
+                                    .map(str::to_string)
+                            })
+                            .unwrap_or_else(|| stream_id.clone());
+                        // The server item ID is the article ID (NNW uses the
+                        // sync service ID as `articleID`): it is what the
+                        // status reconcile and outgoing edit-tag calls key on.
+                        let article_id = entry.unique_id();
 
                         let date_published = entry
                             .published_timestamp

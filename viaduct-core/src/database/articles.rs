@@ -1009,25 +1009,38 @@ fn update_statuses_column(
     if ids.is_empty() {
         return Ok(());
     }
-    const CHUNK: usize = 500;
-    for chunk in ids.chunks(CHUNK) {
-        let placeholders = vec!["?"; chunk.len()].join(", ");
+    // Sync-only path (Reader API status reconcile). Upsert, not UPDATE:
+    // a remote unread/starred ID usually has no local row yet, and the
+    // status row is what `fetch_missing_article_ids` keys the article
+    // download on (NNW creates statuses for unknown article IDs the same
+    // way). A row created by the starred pass defaults to read: an
+    // unread one would already exist from the unread pass that runs
+    // first.
+    // Only the two status flags are ever passed; pin the interpolated
+    // column name to them.
+    let column = if column == "starred" {
+        "starred"
+    } else {
+        "read"
+    };
+    let (read_default, starred_default) = if column == "read" {
+        (value as i64, 0i64)
+    } else {
+        (1i64, value as i64)
+    };
+    let now = Utc::now().timestamp();
+    let tx = conn.transaction()?;
+    {
         let sql = format!(
-            "UPDATE statuses SET {} = ? WHERE article_id IN ({})",
-            column, placeholders
+            "INSERT INTO statuses (article_id, read, starred, date_arrived) VALUES (?, ?, ?, ?)
+             ON CONFLICT(article_id) DO UPDATE SET {column} = excluded.{column}"
         );
-        let mut params = vec![rusqlite::types::Value::from(if value {
-            1i64
-        } else {
-            0i64
-        })];
-        params.extend(
-            chunk
-                .iter()
-                .map(|s| rusqlite::types::Value::from(s.clone())),
-        );
-        conn.execute(&sql, rusqlite::params_from_iter(params))?;
+        let mut stmt = tx.prepare(&sql)?;
+        for id in ids {
+            stmt.execute(params![id, read_default, starred_default, now])?;
+        }
     }
+    tx.commit()?;
     Ok(())
 }
 
