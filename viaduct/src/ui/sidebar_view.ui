@@ -34,7 +34,7 @@
     </section>
     <section>
       <item>
-        <attribute name="label" translatable="yes">Update Inoreader Credentials…</attribute>
+        <attribute name="label" translatable="yes">Sync Account…</attribute>
         <attribute name="action">win.update-credentials</attribute>
       </item>
       <item>

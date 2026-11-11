@@ -2,34 +2,64 @@
 // Copyright (c) 2026 Brandon LaRocque
 // Licensed under the MIT License. See LICENSE in the project root for details.
 
-//! Update Inoreader Credentials dialog (NNW `263ec2683`'s update path for
-//! username/password accounts). The app's only credentials surface until
-//! now was external provisioning; this verifies a token against the
-//! Reader API before storing it, so a typo can't silently kill sync.
+//! Sync Account dialog (NNW `263ec2683`'s update path for
+//! username/password accounts), covering the Reader API services:
+//! Inoreader and self-hosted FreshRSS. Credentials are verified against
+//! the service before being stored, so a typo can't silently kill sync.
+//! The account is chosen at startup, so a service switch applies on the
+//! next launch.
 
 use gtk::glib;
 use gtk::prelude::*;
 
+use crate::network::credentials::{
+    Credentials, delete_credentials, fetch_credentials, store_credentials,
+};
+use crate::network::inoreader::{ReaderAPICaller, ReaderAPIVariant, freshrss_api_base};
 use crate::ui::rows;
 use crate::ui::window::ViaductWindow;
 
+/// Dropdown order; index ↔ variant.
+const SERVICES: [ReaderAPIVariant; 2] = [ReaderAPIVariant::Inoreader, ReaderAPIVariant::FreshRSS];
+
+fn selected_variant(dropdown: &gtk::DropDown) -> ReaderAPIVariant {
+    SERVICES
+        .get(dropdown.selected() as usize)
+        .copied()
+        .unwrap_or(ReaderAPIVariant::Inoreader)
+}
+
 /// Build and present the dialog. Fields pre-fill from the Secret Service
-/// where credentials already exist; Save verifies against the Reader API
-/// and only then stores, so the previously-working token survives a
-/// failed attempt untouched.
+/// where credentials already exist; Save verifies against the service and
+/// only then stores, so the previously-working token survives a failed
+/// attempt untouched.
 pub fn present(parent: &ViaductWindow) {
     let group = rows::group(
-        Some("Inoreader account"),
+        Some("Sync account"),
         Some(
-            "The email and app password (token) viaduct syncs with. Saving verifies the token against Inoreader first; a failed verification leaves the stored credentials untouched.",
+            "The Reader API service viaduct syncs with. Saving verifies the credentials first; a failed verification leaves the stored ones untouched. For FreshRSS, enable API access and use the API password set in your FreshRSS profile.",
         ),
     );
+    let names: Vec<&str> = SERVICES.iter().map(|v| v.display_name()).collect();
+    let (service_row, service_dropdown) = rows::combo_row("Service", None, &names);
+    let (server_row, server_entry) =
+        rows::entry_row(Some("Server"), None, None, Some("https://rss.example.org"));
     let (email_row, email_entry) =
-        rows::entry_row(Some("Email"), None, None, Some("you@example.com"));
+        rows::entry_row(Some("Username"), None, None, Some("you@example.com"));
     let (token_row, token_entry) =
-        rows::entry_row(Some("App password"), None, None, Some("App password token"));
+        rows::entry_row(Some("Password"), None, None, Some("App / API password"));
+    token_entry.set_visibility(false);
+    token_entry.set_input_purpose(gtk::InputPurpose::Password);
+    group.add(&service_row);
+    group.add(&server_row);
     group.add(&email_row);
     group.add(&token_row);
+    server_row.set_visible(false);
+
+    let server_row_for_toggle = server_row.clone();
+    service_dropdown.connect_selected_notify(move |dd| {
+        server_row_for_toggle.set_visible(selected_variant(dd) == ReaderAPIVariant::FreshRSS);
+    });
 
     let status = gtk::Label::builder()
         .halign(gtk::Align::Start)
@@ -37,22 +67,27 @@ pub fn present(parent: &ViaductWindow) {
         .visible(false)
         .build();
 
-    // Pre-fill from the stored credentials (best-effort; a locked or
-    // empty keyring just leaves the fields blank). spawn_future_local:
-    // the entries cross the keyring await, so the future stays on the
-    // main loop.
-    let email_for_prefill = email_entry.clone();
-    let token_for_prefill = token_entry.clone();
-    glib::spawn_future_local(async move {
-        if let Some(creds) = crate::network::credentials::fetch_credentials("inoreader")
-            .await
-            .ok()
-            .flatten()
-        {
-            email_for_prefill.set_text(&creds.username);
-            token_for_prefill.set_text(creds.password.as_deref().unwrap_or_default());
-        }
-    });
+    // Pre-fill from the stored credentials, in the same order the account
+    // is picked at startup (best-effort; a locked or empty keyring just
+    // leaves the fields blank). spawn_future_local: the widgets cross the
+    // keyring await, so the future stays on the main loop.
+    {
+        let dropdown = service_dropdown.clone();
+        let server_entry = server_entry.clone();
+        let email_entry = email_entry.clone();
+        let token_entry = token_entry.clone();
+        glib::spawn_future_local(async move {
+            for (index, variant) in SERVICES.iter().enumerate() {
+                if let Some(creds) = fetch_credentials(variant.account_id()).await.ok().flatten() {
+                    dropdown.set_selected(index as u32);
+                    server_entry.set_text(creds.server.as_deref().unwrap_or_default());
+                    email_entry.set_text(&creds.username);
+                    token_entry.set_text(creds.password.as_deref().unwrap_or_default());
+                    break;
+                }
+            }
+        });
+    }
 
     let buttons = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -80,11 +115,11 @@ pub fn present(parent: &ViaductWindow) {
     content.append(&buttons);
 
     let window = gtk::Window::builder()
-        .title("Update Inoreader Credentials")
+        .title("Sync Account")
         .transient_for(parent)
         .modal(true)
         .default_width(480)
-        .default_height(320)
+        .default_height(360)
         .child(&content)
         .build();
     crate::ui::close_on_escape(&window);
@@ -98,57 +133,95 @@ pub fn present(parent: &ViaductWindow) {
     let status_for_save = status.clone();
     let save_for_save = save.clone();
     save.connect_clicked(move |_| {
+        let variant = selected_variant(&service_dropdown);
+        let server = server_entry.text().trim().to_string();
         let email = email_entry.text().trim().to_string();
         let token = token_entry.text().trim().to_string();
         let window = window_for_save.clone();
         let status = status_for_save.clone();
         let save_btn = save_for_save.clone();
         if email.is_empty() || token.is_empty() {
-            status.set_text("Both the email and the app password are required.");
+            status.set_text("Both the username and the password are required.");
             status.set_visible(true);
             return;
         }
-        // Verify against the Reader API; store only on success. The
-        // button disables for the round trip so a slow token check
-        // can't be double-submitted. Runs on the main loop via
-        // spawn_future_local (the widgets cross the awaits, so the
-        // Send-bounded runtime spawner can't carry them).
+        let is_freshrss = variant == ReaderAPIVariant::FreshRSS;
+        if is_freshrss && server.is_empty() {
+            status.set_text("The FreshRSS server address is required.");
+            status.set_visible(true);
+            return;
+        }
+        // Verify against the service; store only on success. The button
+        // disables for the round trip so a slow check can't be
+        // double-submitted. Runs on the main loop via spawn_future_local
+        // (the widgets cross the awaits, so the Send-bounded runtime
+        // spawner can't carry them).
         save_btn.set_sensitive(false);
-        status.set_text("Verifying against Inoreader…");
+        status.set_text(&format!("Verifying against {}…", variant.display_name()));
         status.set_visible(true);
         glib::spawn_future_local(async move {
-            let caller = crate::network::inoreader::ReaderAPICaller::new(
-                crate::network::inoreader::ReaderAPIVariant::Inoreader,
-            );
-            match caller.validate_credentials(&email, &token).await {
-                Ok(_) => {
-                    let creds = crate::network::credentials::Credentials {
-                        username: email,
-                        password: Some(token),
-                    };
-                    match crate::network::credentials::store_credentials("inoreader", &creds).await
-                    {
-                        Ok(()) => {
-                            window.close();
-                            if let Some(parent) = window
-                                .transient_for()
-                                .and_then(|p| p.downcast::<crate::ui::window::ViaductWindow>().ok())
-                            {
-                                parent.show_toast_public("Inoreader credentials updated.");
-                            }
-                        }
-                        Err(e) => {
-                            save_btn.set_sensitive(true);
-                            status.set_text(&format!("Verified, but storing failed: {e}"));
-                            status.set_visible(true);
-                        }
+            let caller = if is_freshrss {
+                ReaderAPICaller::with_base_url(variant, &freshrss_api_base(&server))
+            } else {
+                ReaderAPICaller::new(variant)
+            };
+            if let Err(e) = caller.validate_credentials(&email, &token).await {
+                save_btn.set_sensitive(true);
+                status.set_text(&format!(
+                    "{} rejected these credentials: {e}",
+                    variant.display_name()
+                ));
+                status.set_visible(true);
+                return;
+            }
+            let creds = Credentials {
+                username: email,
+                password: Some(token),
+                server: is_freshrss.then_some(server),
+            };
+            if let Err(e) = store_credentials(variant.account_id(), &creds).await {
+                save_btn.set_sensitive(true);
+                status.set_text(&format!("Verified, but storing failed: {e}"));
+                status.set_visible(true);
+                return;
+            }
+            // One sync account at a time: drop the other services so the
+            // startup pick lands on the one just saved.
+            let mut switched = false;
+            for other in SERVICES.iter().filter(|v| **v != variant) {
+                if fetch_credentials(other.account_id())
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    switched = true;
+                    if let Err(e) = delete_credentials(other.account_id()).await {
+                        tracing::warn!(
+                            ?e,
+                            service = other.display_name(),
+                            "could not remove old credentials"
+                        );
                     }
                 }
-                Err(e) => {
-                    save_btn.set_sensitive(true);
-                    status.set_text(&format!("Inoreader rejected these credentials: {e}"));
-                    status.set_visible(true);
-                }
+            }
+            window.close();
+            if let Some(parent) = window
+                .transient_for()
+                .and_then(|p| p.downcast::<ViaductWindow>().ok())
+            {
+                let msg = if switched {
+                    format!(
+                        "{} account saved. Restart viaduct to switch syncing to it.",
+                        variant.display_name()
+                    )
+                } else {
+                    format!(
+                        "{} credentials saved. Restart viaduct if sync was not already active.",
+                        variant.display_name()
+                    )
+                };
+                parent.show_toast_public(&msg);
             }
         });
     });
