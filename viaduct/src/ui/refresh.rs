@@ -164,8 +164,9 @@ impl ViaductWindow {
                 return;
             }
             let paired = pair_feeds_with_settings(&account, feeds).await;
-            let tally = run_refresh_with_tally(
-                account,
+            let is_local = account.is_local_account();
+            let mut tally = run_refresh_with_tally(
+                account.clone(),
                 paired,
                 retention_days,
                 force,
@@ -173,6 +174,10 @@ impl ViaductWindow {
                 activity_log,
             )
             .await;
+            if !is_local && let Ok(after) = account.load_opml().await {
+                tally.opml_changed = after.folders != opml.folders
+                    || after.standalone_feeds != opml.standalone_feeds;
+            }
             let _ = done_tx.send(tally);
         });
         self.imp().batch_update.start();
@@ -203,6 +208,9 @@ impl ViaductWindow {
                 // walk is a cheap DB query so badges are accurate
                 // the moment the user re-shows the window.
                 window.dispatch_refresh_notification(&tally);
+                if tally.opml_changed {
+                    window.reload_sidebar_after_opml_change();
+                }
                 window.refresh_unread_counts();
                 if window.is_visible() {
                     window.show_refresh_toast(&tally);
@@ -565,6 +573,9 @@ async fn pair_feeds_with_settings(
 pub(crate) struct RefreshTally {
     pub feeds_attempted: usize,
     pub per_feed_new: std::collections::HashMap<String, usize>,
+    /// A sync account's reconcile rewrote the subscription list, so
+    /// the sidebar tree must be rebuilt from the new OPML.
+    pub opml_changed: bool,
 }
 
 impl RefreshTally {
@@ -685,6 +696,7 @@ async fn run_refresh_with_tally(
     RefreshTally {
         feeds_attempted,
         per_feed_new,
+        opml_changed: false,
     }
 }
 
