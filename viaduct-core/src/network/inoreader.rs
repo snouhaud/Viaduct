@@ -9,14 +9,50 @@ use url::Url;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReaderAPIVariant {
     Inoreader,
+    /// Self-hosted FreshRSS, through its Google Reader compatible API
+    /// (`<server>/api/greader.php`). The base URL is user-supplied.
+    FreshRSS,
 }
 
 impl ReaderAPIVariant {
+    /// Default API base for hosted services. Self-hosted variants have
+    /// none; their base comes from the stored server URL.
     pub fn host(&self) -> &'static str {
         match self {
             Self::Inoreader => "https://www.inoreader.com",
+            Self::FreshRSS => "",
         }
     }
+
+    /// Secret Service `account-id` the credentials are stored under.
+    pub fn account_id(&self) -> &'static str {
+        match self {
+            Self::Inoreader => "inoreader",
+            Self::FreshRSS => "freshrss",
+        }
+    }
+
+    /// Human-readable service name for logs, toasts and dialogs.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::Inoreader => "Inoreader",
+            Self::FreshRSS => "FreshRSS",
+        }
+    }
+}
+
+/// Normalize a user-entered FreshRSS server address into its Google
+/// Reader API base: adds `https://` when no scheme is given, drops
+/// trailing slashes and appends `/api/greader.php` unless present.
+pub fn freshrss_api_base(server: &str) -> String {
+    let mut base = server.trim().trim_end_matches('/').to_string();
+    if !base.contains("://") {
+        base = format!("https://{base}");
+    }
+    if !base.ends_with("/api/greader.php") {
+        base.push_str("/api/greader.php");
+    }
+    base
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -178,6 +214,12 @@ impl ReaderAPIEndpoints {
             Self::SubscriptionImport => "/reader/api/0/subscription/import",
         }
     }
+}
+
+/// Append an endpoint path to an API base, keeping any sub-path of the
+/// base (`Url::join` with an absolute path would replace it).
+fn endpoint_url(base: &str, path: &str) -> std::result::Result<Url, url::ParseError> {
+    Url::parse(&format!("{}{}", base.trim_end_matches('/'), path))
 }
 
 pub enum ItemIDType {
@@ -343,6 +385,10 @@ fn conditional_get_from_response(headers: &reqwest::header::HeaderMap) -> Condit
 pub struct ReaderAPICaller {
     client: reqwest::Client,
     variant: ReaderAPIVariant,
+    /// API base URL without a trailing slash. Endpoint paths are
+    /// appended verbatim (never `Url::join`ed, which would drop a
+    /// sub-path such as FreshRSS's `/api/greader.php`).
+    base_url: String,
     access_token: tokio::sync::RwLock<Option<String>>,
     /// Most recent Zone 1 usage report, refreshed from the rate-limit
     /// headers on every sync-path response. `None` for services that
@@ -352,9 +398,15 @@ pub struct ReaderAPICaller {
 
 impl ReaderAPICaller {
     pub fn new(variant: ReaderAPIVariant) -> Self {
+        Self::with_base_url(variant, variant.host())
+    }
+
+    /// Caller against an explicit API base (self-hosted services).
+    pub fn with_base_url(variant: ReaderAPIVariant, base_url: &str) -> Self {
         Self {
             client: reqwest::Client::new(),
             variant,
+            base_url: base_url.trim_end_matches('/').to_string(),
             access_token: tokio::sync::RwLock::new(None),
             usage_limits: tokio::sync::RwLock::new(None),
         }
@@ -375,8 +427,12 @@ impl ReaderAPICaller {
         self.usage_limits.read().await.clone()
     }
 
-    fn api_base_url(&self) -> Url {
-        Url::parse(self.variant.host()).expect("Invalid base URL")
+    pub fn variant(&self) -> ReaderAPIVariant {
+        self.variant
+    }
+
+    fn endpoint(&self, endpoint: ReaderAPIEndpoints) -> std::result::Result<Url, url::ParseError> {
+        endpoint_url(&self.base_url, endpoint.path())
     }
 
     fn add_variant_headers(&self, mut request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -390,8 +446,7 @@ impl ReaderAPICaller {
 
     pub async fn validate_credentials(&self, username: &str, password: &str) -> Result<String> {
         let url = self
-            .api_base_url()
-            .join(ReaderAPIEndpoints::Login.path())
+            .endpoint(ReaderAPIEndpoints::Login)
             .map_err(|e| ViaductError::Network(NetworkError::InvalidUrl(e)))?;
 
         let mut request = self
@@ -438,8 +493,7 @@ impl ReaderAPICaller {
         }
 
         let url = self
-            .api_base_url()
-            .join(ReaderAPIEndpoints::Token.path())
+            .endpoint(ReaderAPIEndpoints::Token)
             .map_err(|e| ViaductError::Network(NetworkError::InvalidUrl(e)))?;
         let mut request = self
             .client
@@ -520,8 +574,7 @@ impl ReaderAPICaller {
         conditional_get: &ConditionalGetHeaders,
     ) -> Result<ReaderAPIListResult<ReaderAPISubscription>> {
         let url = self
-            .api_base_url()
-            .join(ReaderAPIEndpoints::SubscriptionList.path())
+            .endpoint(ReaderAPIEndpoints::SubscriptionList)
             .map_err(|e| ViaductError::Network(NetworkError::InvalidUrl(e)))?;
         let request = self
             .client
@@ -567,8 +620,7 @@ impl ReaderAPICaller {
         conditional_get: &ConditionalGetHeaders,
     ) -> Result<ReaderAPIListResult<ReaderAPITag>> {
         let url = self
-            .api_base_url()
-            .join(ReaderAPIEndpoints::TagList.path())
+            .endpoint(ReaderAPIEndpoints::TagList)
             .map_err(|e| ViaductError::Network(NetworkError::InvalidUrl(e)))?;
         let request = self
             .client
@@ -618,8 +670,7 @@ impl ReaderAPICaller {
         url: &str,
     ) -> Result<ReaderAPISubscription> {
         let endpoint = self
-            .api_base_url()
-            .join(ReaderAPIEndpoints::SubscriptionAdd.path())
+            .endpoint(ReaderAPIEndpoints::SubscriptionAdd)
             .map_err(|e| ViaductError::Network(NetworkError::InvalidUrl(e)))?;
 
         let resp = self
@@ -655,8 +706,7 @@ impl ReaderAPICaller {
 
     pub async fn delete_subscription(&self, auth_token: &str, subscription_id: &str) -> Result<()> {
         let endpoint = self
-            .api_base_url()
-            .join(ReaderAPIEndpoints::SubscriptionEdit.path())
+            .endpoint(ReaderAPIEndpoints::SubscriptionEdit)
             .map_err(|e| ViaductError::Network(NetworkError::InvalidUrl(e)))?;
 
         let resp = self
@@ -689,8 +739,7 @@ impl ReaderAPICaller {
         title: Option<&str>,
     ) -> Result<()> {
         let endpoint = self
-            .api_base_url()
-            .join(ReaderAPIEndpoints::SubscriptionEdit.path())
+            .endpoint(ReaderAPIEndpoints::SubscriptionEdit)
             .map_err(|e| ViaductError::Network(NetworkError::InvalidUrl(e)))?;
 
         let resp = self
@@ -775,8 +824,7 @@ impl ReaderAPICaller {
 
     pub async fn rename_tag(&self, auth_token: &str, old_name: &str, new_name: &str) -> Result<()> {
         let endpoint = self
-            .api_base_url()
-            .join(ReaderAPIEndpoints::RenameTag.path())
+            .endpoint(ReaderAPIEndpoints::RenameTag)
             .map_err(|e| ViaductError::Network(NetworkError::InvalidUrl(e)))?;
 
         let resp = self
@@ -802,8 +850,7 @@ impl ReaderAPICaller {
 
     pub async fn delete_tag(&self, auth_token: &str, folder_external_id: &str) -> Result<()> {
         let endpoint = self
-            .api_base_url()
-            .join(ReaderAPIEndpoints::DisableTag.path())
+            .endpoint(ReaderAPIEndpoints::DisableTag)
             .map_err(|e| ViaductError::Network(NetworkError::InvalidUrl(e)))?;
 
         let resp = self
@@ -833,8 +880,7 @@ impl ReaderAPICaller {
         }
 
         let endpoint = self
-            .api_base_url()
-            .join(ReaderAPIEndpoints::Contents.path())
+            .endpoint(ReaderAPIEndpoints::Contents)
             .map_err(|e| ViaductError::Network(NetworkError::InvalidUrl(e)))?;
 
         let resp = self
@@ -912,8 +958,7 @@ impl ReaderAPICaller {
             }
 
             let url = self
-                .api_base_url()
-                .join(ReaderAPIEndpoints::ItemIds.path())
+                .endpoint(ReaderAPIEndpoints::ItemIds)
                 .map_err(|e| ViaductError::Network(NetworkError::InvalidUrl(e)))?;
             let mut request = self
                 .client
@@ -963,8 +1008,7 @@ impl ReaderAPICaller {
         }
 
         let endpoint = self
-            .api_base_url()
-            .join(ReaderAPIEndpoints::EditTag.path())
+            .endpoint(ReaderAPIEndpoints::EditTag)
             .map_err(|e| ViaductError::Network(NetworkError::InvalidUrl(e)))?;
 
         let action = if add { "a" } else { "r" };
@@ -1000,8 +1044,7 @@ impl ReaderAPICaller {
 
     pub async fn import_opml(&self, auth_token: &str, opml_data: &[u8]) -> Result<()> {
         let endpoint = self
-            .api_base_url()
-            .join(ReaderAPIEndpoints::SubscriptionImport.path())
+            .endpoint(ReaderAPIEndpoints::SubscriptionImport)
             .map_err(|e| ViaductError::Network(NetworkError::InvalidUrl(e)))?;
 
         let mut request = self
@@ -1028,6 +1071,48 @@ impl ReaderAPICaller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_url_keeps_base_sub_path() {
+        let url = endpoint_url(
+            "https://rss.example.org/api/greader.php",
+            ReaderAPIEndpoints::TagList.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://rss.example.org/api/greader.php/reader/api/0/tag/list"
+        );
+    }
+
+    #[test]
+    fn endpoint_url_inoreader_unchanged() {
+        let url = endpoint_url(
+            ReaderAPIVariant::Inoreader.host(),
+            ReaderAPIEndpoints::Login.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://www.inoreader.com/accounts/ClientLogin"
+        );
+    }
+
+    #[test]
+    fn freshrss_api_base_normalizes() {
+        assert_eq!(
+            freshrss_api_base("rss.example.org/"),
+            "https://rss.example.org/api/greader.php"
+        );
+        assert_eq!(
+            freshrss_api_base("http://home.lan/freshrss/p"),
+            "http://home.lan/freshrss/p/api/greader.php"
+        );
+        assert_eq!(
+            freshrss_api_base("https://rss.example.org/api/greader.php/"),
+            "https://rss.example.org/api/greader.php"
+        );
+    }
 
     fn make_entry(article_id: &str) -> ReaderAPIEntry {
         ReaderAPIEntry {

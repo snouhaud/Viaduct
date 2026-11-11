@@ -257,8 +257,15 @@ impl Default for InoreaderAccountDelegate {
 
 impl InoreaderAccountDelegate {
     pub fn new() -> Self {
+        Self::with_caller(ReaderAPICaller::new(ReaderAPIVariant::Inoreader))
+    }
+
+    /// Delegate over any Reader API service (Inoreader, FreshRSS). The
+    /// caller carries the variant and API base; credentials are looked up
+    /// under the variant's Secret Service account id.
+    pub fn with_caller(caller: ReaderAPICaller) -> Self {
         Self {
-            caller: ReaderAPICaller::new(ReaderAPIVariant::Inoreader),
+            caller,
             rate_limiter: SyncRateLimiter::new(),
         }
     }
@@ -289,16 +296,21 @@ impl InoreaderAccountDelegate {
     }
 
     async fn get_auth_token(&self) -> Result<String> {
-        let creds = fetch_credentials("inoreader").await?.ok_or_else(|| {
-            ViaductError::Network(NetworkError::Auth(
-                "no Inoreader credentials in the keyring".to_string(),
-            ))
-        })?;
+        let variant = self.caller.variant();
+        let creds = fetch_credentials(variant.account_id())
+            .await?
+            .ok_or_else(|| {
+                ViaductError::Network(NetworkError::Auth(format!(
+                    "no {} credentials in the keyring",
+                    variant.display_name()
+                )))
+            })?;
 
         let password = creds.password.ok_or_else(|| {
-            ViaductError::Network(NetworkError::Auth(
-                "stored Inoreader credentials carry no password".to_string(),
-            ))
+            ViaductError::Network(NetworkError::Auth(format!(
+                "stored {} credentials carry no password",
+                variant.display_name()
+            )))
         })?;
         self.caller
             .validate_credentials(&creds.username, &password)

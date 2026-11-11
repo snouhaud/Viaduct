@@ -58,18 +58,15 @@ impl Account {
         // system without a running keyring daemon (a bare Wayland session, a
         // container, CI), which took the whole app down at startup rather
         // than degrading to the local account it would have used anyway.
-        let creds = match crate::network::credentials::fetch_credentials("inoreader").await {
-            Ok(creds) => creds,
-            Err(e) => {
-                tracing::warn!(?e, "Secret Service unavailable; using a local account");
-                None
+        let delegate: Arc<dyn AccountDelegate> = match Self::find_reader_api_caller().await {
+            Some(caller) => {
+                tracing::info!(
+                    service = caller.variant().display_name(),
+                    "using a Reader API sync account"
+                );
+                Arc::new(crate::database::delegate::InoreaderAccountDelegate::with_caller(caller))
             }
-        };
-
-        let delegate: Arc<dyn AccountDelegate> = if creds.is_some() {
-            Arc::new(crate::database::delegate::InoreaderAccountDelegate::new())
-        } else {
-            Arc::new(LocalAccountDelegate)
+            None => Arc::new(LocalAccountDelegate),
         };
 
         let account = Self {
@@ -91,6 +88,37 @@ impl Account {
         }
 
         Ok(account)
+    }
+
+    /// Pick the Reader API service with stored credentials: Inoreader
+    /// first, then FreshRSS (which also needs its stored server address).
+    /// `None` keeps the local account.
+    async fn find_reader_api_caller() -> Option<crate::network::inoreader::ReaderAPICaller> {
+        use crate::network::inoreader::{ReaderAPICaller, ReaderAPIVariant, freshrss_api_base};
+        for variant in [ReaderAPIVariant::Inoreader, ReaderAPIVariant::FreshRSS] {
+            let creds =
+                match crate::network::credentials::fetch_credentials(variant.account_id()).await {
+                    Ok(Some(creds)) => creds,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!(?e, "Secret Service unavailable; using a local account");
+                        return None;
+                    }
+                };
+            match variant {
+                ReaderAPIVariant::Inoreader => return Some(ReaderAPICaller::new(variant)),
+                ReaderAPIVariant::FreshRSS => match creds.server.as_deref() {
+                    Some(server) if !server.trim().is_empty() => {
+                        return Some(ReaderAPICaller::with_base_url(
+                            variant,
+                            &freshrss_api_base(server),
+                        ));
+                    }
+                    _ => tracing::warn!("FreshRSS credentials carry no server address; ignored"),
+                },
+            }
+        }
+        None
     }
 
     pub async fn load_opml(&self) -> Result<OpmlFile> {
