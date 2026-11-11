@@ -77,14 +77,26 @@ pub fn present(parent: &ViaductWindow) {
         let email_entry = email_entry.clone();
         let token_entry = token_entry.clone();
         glib::spawn_future_local(async move {
-            for (index, variant) in SERVICES.iter().enumerate() {
-                if let Some(creds) = fetch_credentials(variant.account_id()).await.ok().flatten() {
-                    dropdown.set_selected(index as u32);
-                    server_entry.set_text(creds.server.as_deref().unwrap_or_default());
-                    email_entry.set_text(&creds.username);
-                    token_entry.set_text(creds.password.as_deref().unwrap_or_default());
-                    break;
+            // The keyring lookup (zbus) needs the tokio reactor, so it runs
+            // on the library runtime; only the widget updates stay here.
+            let found = crate::spawn_on_runtime(async {
+                for (index, variant) in SERVICES.iter().enumerate() {
+                    if let Some(creds) =
+                        fetch_credentials(variant.account_id()).await.ok().flatten()
+                    {
+                        return Some((index, creds));
+                    }
                 }
+                None
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some((index, creds)) = found {
+                dropdown.set_selected(index as u32);
+                server_entry.set_text(creds.server.as_deref().unwrap_or_default());
+                email_entry.set_text(&creds.username);
+                token_entry.set_text(creds.password.as_deref().unwrap_or_default());
             }
         });
     }
@@ -153,58 +165,28 @@ pub fn present(parent: &ViaductWindow) {
         }
         // Verify against the service; store only on success. The button
         // disables for the round trip so a slow check can't be
-        // double-submitted. Runs on the main loop via spawn_future_local
-        // (the widgets cross the awaits, so the Send-bounded runtime
-        // spawner can't carry them).
+        // double-submitted.
         save_btn.set_sensitive(false);
         status.set_text(&format!("Verifying against {}…", variant.display_name()));
         status.set_visible(true);
         glib::spawn_future_local(async move {
-            let caller = if is_freshrss {
-                ReaderAPICaller::with_base_url(variant, &freshrss_api_base(&server))
-            } else {
-                ReaderAPICaller::new(variant)
-            };
-            if let Err(e) = caller.validate_credentials(&email, &token).await {
-                save_btn.set_sensitive(true);
-                status.set_text(&format!(
-                    "{} rejected these credentials: {e}",
-                    variant.display_name()
-                ));
-                status.set_visible(true);
-                return;
-            }
-            let creds = Credentials {
-                username: email,
-                password: Some(token),
-                server: is_freshrss.then_some(server),
-            };
-            if let Err(e) = store_credentials(variant.account_id(), &creds).await {
-                save_btn.set_sensitive(true);
-                status.set_text(&format!("Verified, but storing failed: {e}"));
-                status.set_visible(true);
-                return;
-            }
-            // One sync account at a time: drop the other services so the
-            // startup pick lands on the one just saved.
-            let mut switched = false;
-            for other in SERVICES.iter().filter(|v| **v != variant) {
-                if fetch_credentials(other.account_id())
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some()
-                {
-                    switched = true;
-                    if let Err(e) = delete_credentials(other.account_id()).await {
-                        tracing::warn!(
-                            ?e,
-                            service = other.display_name(),
-                            "could not remove old credentials"
-                        );
-                    }
+            // Network (reqwest) and keyring (zbus) calls need the tokio
+            // reactor: run them on the library runtime and only touch
+            // widgets back here on the main loop.
+            let outcome = crate::spawn_on_runtime(async move {
+                verify_and_store(variant, server, email, token).await
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("internal error: {e}")));
+            let switched = match outcome {
+                Ok(switched) => switched,
+                Err(msg) => {
+                    save_btn.set_sensitive(true);
+                    status.set_text(&msg);
+                    status.set_visible(true);
+                    return;
                 }
-            }
+            };
             window.close();
             if let Some(parent) = window
                 .transient_for()
@@ -227,4 +209,53 @@ pub fn present(parent: &ViaductWindow) {
     });
 
     window.present();
+}
+
+/// Verify `email`/`token` against `variant`, store them, and drop the
+/// other services' credentials (one sync account at a time, so the
+/// startup pick lands on the one just saved). Returns whether another
+/// service was replaced. Must run on the tokio runtime.
+async fn verify_and_store(
+    variant: ReaderAPIVariant,
+    server: String,
+    email: String,
+    token: String,
+) -> Result<bool, String> {
+    let is_freshrss = variant == ReaderAPIVariant::FreshRSS;
+    let caller = if is_freshrss {
+        ReaderAPICaller::with_base_url(variant, &freshrss_api_base(&server))
+    } else {
+        ReaderAPICaller::new(variant)
+    };
+    caller
+        .validate_credentials(&email, &token)
+        .await
+        .map_err(|e| format!("{} rejected these credentials: {e}", variant.display_name()))?;
+    let creds = Credentials {
+        username: email,
+        password: Some(token),
+        server: is_freshrss.then_some(server),
+    };
+    store_credentials(variant.account_id(), &creds)
+        .await
+        .map_err(|e| format!("Verified, but storing failed: {e}"))?;
+    let mut switched = false;
+    for other in SERVICES.iter().filter(|v| **v != variant) {
+        if fetch_credentials(other.account_id())
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            switched = true;
+            if let Err(e) = delete_credentials(other.account_id()).await {
+                tracing::warn!(
+                    ?e,
+                    service = other.display_name(),
+                    "could not remove old credentials"
+                );
+            }
+        }
+    }
+    Ok(switched)
 }
